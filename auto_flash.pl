@@ -124,6 +124,7 @@ die "invalid badge type.\n" if defined $badge_type && $badge_type !~ /\A(?:sl|n|
 
 my $esptool_path = './esptool';
 my $esptool = "$esptool_path/esptool.py";
+my $espefuse = "$esptool_path/espefuse.py";
 
 my $esptool_opts="--chip esp32 --port $dev --baud 921600 --before default_reset --after hard_reset";
 
@@ -133,7 +134,7 @@ my $flash_opts="-z --flash_mode dio --flash_freq 80m --flash_size detect";
 my @flash_parts = qw(
      0x1000  ./firmware/bootloader.bin
     0x10000  ./firmware/sha2017-badge.bin
-   0x191000  ./firmware/locfd-$type.zip
+   0x1e1000  ./firmware/locfd-$type.zip
      0x8000  ./firmware/partitions-$size.bin
 );
 
@@ -149,10 +150,52 @@ while ( ! -r $dev ) {
 
 my $t_start = time();
 
+my $dev_info = dev_info($dev);
+print "device info:\n".Dumper($dev_info);
+
+my $mac;
+
+sub esptool_cmd {
+	my $cmd = shift;
+
+	while (1) {
+		my $res = system($cmd);
+		if ($res == 0) { return; }
+
+		# error; request flash-id
+		while (1) {
+			my $res = `python $esptool $esptool_opts flash_id`;
+			if ($?) {
+				warn "Failed to request flash size: $?\n";
+				select(undef,undef,undef,0.1);
+				next;
+			}
+
+			if ($res =~ /MAC: ([0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f])/) {
+				die "different mac found!\n" if $1 ne $mac;
+				last;
+			}
+		}
+	}
+}
+
+my $chip_ok = 0;
 unless (defined $flash_size) {
 	print "=== request flash size ===\n";
 	my $res = `python $esptool $esptool_opts flash_id`;
 	die "Failed to request flash size: $?\n" if $?;
+	if ($res =~ /Chip is ESP32D0WDQ5 \(revision 1\)/) {
+		# ok, hacker hotel
+		warn "correct esp32 chip found\n";
+		$chip_ok = 1;
+	} else {
+		die "correct esp32 chip not found.\n";
+	}
+
+	if ($res =~ /MAC: ([0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f])/) {
+		$mac = $1;
+	}
+
 	print $res;
 	if ($res =~ /Detected flash size: (\d+MB)/) {
 		$flash_size = $1;
@@ -162,8 +205,6 @@ unless (defined $flash_size) {
 }
 
 unless (defined $badge_type) {
-	my $dev_info = dev_info($dev);
-	print "device info:\n".Dumper($dev_info);
 	if ($dev_info->{'product'} eq 'CP2102N USB to UART Bridge Controller') {
 		$badge_type = 'n';
 	} elsif ($dev_info->{'product'} eq 'CP2102 USB to UART Bridge Controller' || $dev_info->{'product'} eq 'SHA2017-Badge') {
@@ -179,15 +220,21 @@ unless (defined $badge_type) {
 
 print "size='$flash_size', type='$badge_type'\n";
 
+if ($chip_ok) {
+	warn "correct esp32 chip found; burning fuses\n";
+	print("$espefuse --port $dev --do-not-confirm set_flash_voltage 3.3V\n");
+	esptool_cmd("$espefuse --port $dev --do-not-confirm set_flash_voltage 3.3V");
+}
+
 print "=== erasing flash ===\n";
-system("python $esptool $esptool_opts erase_flash") and die "Failed to erase flash: $?\n";
+esptool_cmd("python $esptool $esptool_opts erase_flash") and die "Failed to erase flash: $?\n";
 my $t_erase_done = time();
 
 print "=== flashing firmware ===\n";
 my $flash_parts = "@flash_parts";
 $flash_parts =~ s/\$size\b/$flash_size/g;
 $flash_parts =~ s/\$type\b/$badge_type/g;
-system("python $esptool $esptool_opts write_flash $flash_opts $flash_parts") and die "failed to flash images: $?\n";
+esptool_cmd("python $esptool $esptool_opts write_flash $flash_opts $flash_parts") and die "failed to flash images: $?\n";
 
 # do an extra sleep to give the OS some time to recreate the device
 # after reboot.
